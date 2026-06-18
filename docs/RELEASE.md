@@ -92,7 +92,8 @@ Use the output as `TASKSHELL_KEYSTORE_BASE64`.
 The workflow behavior is:
 
 - push / pull request on `main` or `master`: build debug APK;
-- tag `v*` or manual workflow dispatch: build signed release APK.
+- manual workflow dispatch: build signed release APK and upload it as an Actions artifact;
+- tag `v*`: build signed release APK, create/update a GitHub Release, and upload the APK as a release asset.
 
 Suggested release tag:
 
@@ -104,6 +105,13 @@ Suggested release asset:
 
 ```text
 app-release.apk
+```
+
+To publish a release, push a version tag after configuring the required secrets:
+
+```bash
+git tag -a v1.0.0 -m "Taskshell v1.0.0"
+git push origin v1.0.0
 ```
 
 Do not upload the keystore or passwords as release assets or commit them to Git.
