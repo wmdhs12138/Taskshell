@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 108 108" role="img" aria-label="Taskshell icon">
+  <rect width="108" height="108" rx="24" fill="#101820"/>
+  <rect x="19" y="31" width="70" height="46" rx="6" fill="#4CAF50"/>
+  <path d="M33 43l13 11-13 11-4-5 7-6-7-6zM51 63h25v6H51z" fill="#FFFFFF"/>
+</svg>

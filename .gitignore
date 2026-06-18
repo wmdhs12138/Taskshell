@@ -1,0 +1,16 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+app/build/
+
+# Release signing secrets
+keystore/
+signing.env
+*.jks
+*.keystore
+
+# Kotlin local cache/errors
+.kotlin/
