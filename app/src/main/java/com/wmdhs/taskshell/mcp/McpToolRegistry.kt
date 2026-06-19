@@ -2,6 +2,8 @@ package com.wmdhs.taskshell.mcp
 
 import com.wmdhs.taskshell.audit.AuditEvent
 import com.wmdhs.taskshell.audit.AuditLogStore
+import com.wmdhs.taskshell.service.ServiceEventLogger
+import com.wmdhs.taskshell.task.ShellExecResult
 import com.wmdhs.taskshell.task.ShellTask
 import com.wmdhs.taskshell.task.ShellTaskManager
 
@@ -48,6 +50,10 @@ class McpToolRegistry(
         McpTool(
             name = "audit_clear",
             description = "Clear in-memory audit events."
+        ),
+        McpTool(
+            name = "service_diagnostics",
+            description = "Show Taskshell process lifecycle diagnostics and recent service event log."
         )
     )
 
@@ -85,6 +91,7 @@ class McpToolRegistry(
                 )
                 "audit_logs" -> AuditLogStore.list((arguments["limit"] as? Number)?.toInt() ?: 50)
                 "audit_clear" -> mapOf("cleared" to true).also { AuditLogStore.clear() }
+                "service_diagnostics" -> ServiceEventLogger.diagnostics()
                 else -> error("Unknown tool: $name")
             }
             if (!name.startsWith("audit.")) {
@@ -122,6 +129,7 @@ class McpToolRegistry(
     private fun extractTaskId(result: Any): String? {
         return when (result) {
             is ShellTask -> result.taskId
+            is ShellExecResult -> result.task.taskId
             is Map<*, *> -> {
                 (result["taskId"] as? String)
                     ?: (result["task"] as? ShellTask)?.taskId

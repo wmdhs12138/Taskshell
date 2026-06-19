@@ -1,5 +1,7 @@
 package com.wmdhs.taskshell.mcp
 
+import com.wmdhs.taskshell.service.ServiceEventLogger
+import com.wmdhs.taskshell.service.ServiceHeartbeatController
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedWriter
@@ -118,6 +120,9 @@ class LocalHttpMcpServer(
     private fun route(method: String, rawPath: String, body: String, headers: Map<String, String>): HttpResponse {
         return try {
             val path = rawPath.substringBefore('?')
+            if (method != "OPTIONS") {
+                ServiceHeartbeatController.notifyActivity("http_${method}_${path}")
+            }
             if (method != "OPTIONS" && path != "/health" && !isAuthorized(headers)) {
                 return HttpResponse(
                     statusCode = 401,
@@ -133,6 +138,7 @@ class LocalHttpMcpServer(
                         .put("host", host)
                         .put("port", port)
                         .put("time", Instant.now().toString())
+                        .put("diagnostics", ServiceEventLogger.diagnostics().toJsonValue())
                 )
 
                 method == "GET" && path == "/tools" -> ok(
@@ -336,6 +342,7 @@ class LocalHttpMcpServer(
                 JSONObject().put("limit", intProp("Maximum audit events to return.", 50))
             )
             "audit_clear" -> schema(JSONObject())
+            "service_diagnostics" -> schema(JSONObject())
             else -> schema(JSONObject())
         }
     }

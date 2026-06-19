@@ -8,9 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import androidx.core.app.NotificationCompat
 import com.wmdhs.taskshell.MainActivity
 import com.wmdhs.taskshell.R
@@ -18,46 +16,45 @@ import com.wmdhs.taskshell.mcp.McpServer
 
 class TaskshellForegroundService : Service() {
     private val mcpServer by lazy { McpServer(applicationContext) }
-    private val notificationHandler by lazy { Handler(Looper.getMainLooper()) }
-    private val notificationRefreshRunnable = object : Runnable {
-        override fun run() {
-            if (TaskshellServiceState.running) {
-                updateNotification("Local MCP server is active at 127.0.0.1:8765")
-                notificationHandler.postDelayed(this, NOTIFICATION_REFRESH_INTERVAL_MS)
-            }
-        }
-    }
 
     override fun onCreate() {
         super.onCreate()
+        ServiceEventLogger.init(applicationContext)
+        ServiceEventLogger.record("service_create")
         createNotificationChannel()
         TaskshellServiceState.lastEvent = "Service created"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ServiceEventLogger.record("service_start_command", mapOf("startId" to startId.toString(), "flags" to flags.toString()))
         startForeground(NOTIFICATION_ID, buildNotification("Starting local MCP server..."))
         return try {
             mcpServer.start()
             TaskshellServiceState.running = true
             TaskshellServiceState.lastError = null
             TaskshellServiceState.lastEvent = "MCP server started at ${McpServer.DEFAULT_ENDPOINT}"
+            ServiceEventLogger.record("mcp_server_start", mapOf("endpoint" to McpServer.DEFAULT_ENDPOINT))
             updateNotification("Local MCP server is active at 127.0.0.1:8765")
-            scheduleNotificationRefresh()
             START_STICKY
         } catch (throwable: Throwable) {
             TaskshellServiceState.running = false
             TaskshellServiceState.lastError = throwable.message ?: throwable::class.java.name
             TaskshellServiceState.lastEvent = "Failed to start MCP server"
+            ServiceEventLogger.record("mcp_server_start_failed", mapOf("error" to (TaskshellServiceState.lastError ?: throwable::class.java.name)))
             updateNotification("Failed: ${TaskshellServiceState.lastError}")
             START_NOT_STICKY
         }
     }
 
     override fun onDestroy() {
-        notificationHandler.removeCallbacks(notificationRefreshRunnable)
+        ServiceHeartbeatController.stop()
+        ServiceEventLogger.record("service_destroy_begin")
         runCatching { mcpServer.stop() }
+            .onSuccess { ServiceEventLogger.record("mcp_server_stop") }
+            .onFailure { ServiceEventLogger.record("mcp_server_stop_failed", mapOf("error" to (it.message ?: it::class.java.name))) }
         TaskshellServiceState.running = false
         TaskshellServiceState.lastEvent = "Service destroyed"
+        ServiceEventLogger.record("service_destroy")
         super.onDestroy()
     }
 
@@ -79,11 +76,6 @@ class TaskshellForegroundService : Service() {
     private fun updateNotification(text: String) {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(NOTIFICATION_ID, buildNotification(text))
-    }
-
-    private fun scheduleNotificationRefresh() {
-        notificationHandler.removeCallbacks(notificationRefreshRunnable)
-        notificationHandler.postDelayed(notificationRefreshRunnable, NOTIFICATION_REFRESH_INTERVAL_MS)
     }
 
     private fun buildNotification(text: String): Notification {
@@ -117,6 +109,5 @@ class TaskshellForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "taskshell_service"
         private const val NOTIFICATION_ID = 1001
-        private const val NOTIFICATION_REFRESH_INTERVAL_MS = 30_000L
     }
 }

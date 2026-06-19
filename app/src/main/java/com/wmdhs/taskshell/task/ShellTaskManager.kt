@@ -15,10 +15,12 @@ class ShellTaskManager(
 
     fun exec(command: String, workingDirectory: String?, waitMillis: Long): ShellExecResult {
         val task = start(command, workingDirectory)
-        return ShellExecResult(mode = "background", task = task)
+        return waitForShortTask(task, waitMillis)
     }
 
+    @Synchronized
     fun start(command: String, workingDirectory: String?): ShellTask {
+        refreshActiveTasks()
         taskLimiter.cleanupFinished(tasks)
         val policy = commandPolicy.validate(command, workingDirectory)
         require(policy.allowed) { policy.reason ?: "Command blocked by safety policy" }
@@ -40,30 +42,38 @@ class ShellTaskManager(
             lastRequestId = result.requestId
         )
         tasks[taskId] = task
-        taskLimiter.register(taskId, policy.taskKind)
+        if (task.status == ShellTaskStatus.Queued || task.status == ShellTaskStatus.Running) {
+            taskLimiter.register(taskId, policy.taskKind)
+        }
         return if (callback == null) task else task.copy(updatedAt = Instant.now()).also { tasks[taskId] = it }
     }
 
     fun status(taskId: String): ShellTask {
-        return tasks[taskId] ?: recoverOne(taskId) ?: error("Task not found: $taskId")
+        requireSafeTaskId(taskId)
+        return tasks[taskId]
+            ?: error("Task not found in app memory: $taskId. If this task was created before service restart, call shell_task_recover explicitly; automatic recovery is intentionally skipped to avoid blocking status polling.")
     }
 
     fun statusDetails(taskId: String): Map<String, Any?> {
         val task = status(taskId)
         val result = executor.statusTask(taskId)
-        val callback = result.awaitCallback(QUERY_CALLBACK_TIMEOUT_MS)
+        val callback = if (result.accepted) result.awaitCallback(QUERY_CALLBACK_TIMEOUT_MS) else null
+        val queryFailed = !result.accepted || callback == null
         val parsed = callback?.stdout?.parseKeyValueLines().orEmpty()
         val statusFromTermux = parsed["status"]
         val running = parsed["running"]?.toBooleanStrictOrNull()
         val exitCode = parsed["exitCode"]?.takeIf { it.isNotBlank() }?.toIntOrNull()
-        val inferredStatus = inferStatus(task.status, statusFromTermux, running, exitCode)
-        val updated = task.copy(
-            status = inferredStatus,
-            updatedAt = Instant.now(),
-            lastRequestId = result.requestId
-        )
+        val updated = if (queryFailed) {
+            task.copy(lastRequestId = result.requestId)
+        } else {
+            task.copy(
+                status = inferStatus(task.status, statusFromTermux, running, exitCode),
+                updatedAt = Instant.now(),
+                lastRequestId = result.requestId
+            )
+        }
         tasks[taskId] = updated
-        if (updated.status == ShellTaskStatus.Finished || updated.status == ShellTaskStatus.Failed || updated.status == ShellTaskStatus.Stopped) {
+        if (updated.status.isTerminal()) {
             taskLimiter.unregister(taskId)
         }
         return mapOf(
@@ -72,26 +82,37 @@ class ShellTaskManager(
             "transport" to result.transport,
             "requestId" to result.requestId,
             "callbackReceived" to (callback != null),
+            "queryFailed" to queryFailed,
+            "stale" to queryFailed,
+            "message" to if (queryFailed) staleStatusMessage(taskId) else null,
             "stdout" to callback?.stdout,
             "stderr" to callback?.stderr,
             "exitCode" to callback?.exitCode,
             "parsed" to parsed,
             "rawExtras" to callback?.rawExtras,
-            "error" to result.error
+            "error" to (result.error ?: if (queryFailed) "Status query did not return a callback before timeout" else null)
         )
     }
 
     fun logs(taskId: String, maxLines: Int): Map<String, Any?> {
         val task = status(taskId)
         val result = executor.logsTask(taskId, maxLines)
-        val callback = result.awaitCallback(QUERY_CALLBACK_TIMEOUT_MS)
+        val callback = if (result.accepted) result.awaitCallback(QUERY_CALLBACK_TIMEOUT_MS) else null
+        val queryFailed = !result.accepted || callback == null
         val parsed = callback?.stdout?.parseKeyValueLines().orEmpty()
         val statusFromTermux = parsed["status"]
         val exitCodeFromTermux = parsed["exitCode"]?.takeIf { it.isNotBlank() }?.toIntOrNull()
-        val inferredStatus = inferStatus(task.status, statusFromTermux, null, exitCodeFromTermux)
-        val updated = task.copy(status = inferredStatus, updatedAt = Instant.now(), lastRequestId = result.requestId)
+        val updated = if (queryFailed) {
+            task.copy(lastRequestId = result.requestId)
+        } else {
+            task.copy(
+                status = inferStatus(task.status, statusFromTermux, null, exitCodeFromTermux),
+                updatedAt = Instant.now(),
+                lastRequestId = result.requestId
+            )
+        }
         tasks[taskId] = updated
-        if (updated.status == ShellTaskStatus.Finished || updated.status == ShellTaskStatus.Failed || updated.status == ShellTaskStatus.Stopped) {
+        if (updated.status.isTerminal()) {
             taskLimiter.unregister(taskId)
         }
         return mapOf(
@@ -102,13 +123,16 @@ class ShellTaskManager(
             "transport" to result.transport,
             "requestId" to result.requestId,
             "callbackReceived" to (callback != null),
+            "queryFailed" to queryFailed,
+            "stale" to queryFailed,
+            "message" to if (queryFailed) staleStatusMessage(taskId) else null,
             "stdout" to callback?.stdout,
             "stderr" to callback?.stderr,
             "exitCode" to (callback?.exitCode ?: exitCodeFromTermux),
             "parsed" to parsed,
             "rawExtras" to callback?.rawExtras,
             "command" to result.command,
-            "error" to result.error
+            "error" to (result.error ?: if (queryFailed) "Log query did not return a callback before timeout" else null)
         )
     }
 
@@ -128,7 +152,7 @@ class ShellTaskManager(
 
     fun recover(): Map<String, Any?> {
         val result = executor.recoverTasks()
-        val callback = result.awaitCallback(RECOVER_CALLBACK_TIMEOUT_MS)
+        val callback = if (result.accepted) result.awaitCallback(RECOVER_CALLBACK_TIMEOUT_MS) else null
         val recoverStdout = callback?.stdout ?: callback?.rawExtras?.extractEmbeddedStdout()
         val recovered = recoverStdout?.let { parseRecoveredTasks(it) }.orEmpty()
         recovered.forEach { task ->
@@ -189,15 +213,78 @@ class ShellTaskManager(
 
     fun list(): List<ShellTask> {
         taskLimiter.cleanupFinished(tasks)
-        if (tasks.isEmpty()) recover()
         return tasks.values.sortedByDescending { it.createdAt }
     }
 
-    private fun recoverOne(taskId: String): ShellTask? {
-        require(Regex("^[a-zA-Z0-9_.-]{1,80}$").matches(taskId)) { "Invalid taskId" }
-        val recovered = recover()["tasks"] as? List<*> ?: return null
-        return recovered.filterIsInstance<ShellTask>().firstOrNull { it.taskId == taskId }
+    private fun waitForShortTask(task: ShellTask, waitMillis: Long): ShellExecResult {
+        val timeout = waitMillis.coerceIn(0L, MAX_EXEC_WAIT_TIMEOUT_MS)
+        if (timeout == 0L || task.status == ShellTaskStatus.Failed) {
+            return ShellExecResult(mode = "background", task = task)
+        }
+
+        val deadline = System.currentTimeMillis() + timeout
+        var latest = task
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(EXEC_POLL_INTERVAL_MS.coerceAtMost((deadline - System.currentTimeMillis()).coerceAtLeast(1L)))
+            val details = runCatching { statusDetails(task.taskId) }.getOrNull() ?: break
+            latest = details["task"] as? ShellTask ?: latest
+            if (latest.status == ShellTaskStatus.Finished || latest.status == ShellTaskStatus.Failed || latest.status == ShellTaskStatus.Stopped) {
+                val logDetails = runCatching { logs(task.taskId, MAX_EXEC_INLINE_LOG_LINES) }.getOrNull()
+                val stdout = logDetails?.get("stdout") as? String
+                val stderr = logDetails?.get("stderr") as? String
+                val exitCode = logDetails?.get("exitCode") as? Int
+                return ShellExecResult(
+                    mode = "foreground",
+                    task = latest,
+                    stdout = stdout?.substringAfter("--- stdout ---\n")?.substringBefore("--- stderr ---")?.trimEnd(),
+                    stderr = stderr,
+                    exitCode = exitCode
+                )
+            }
+        }
+        return ShellExecResult(mode = "background", task = latest)
     }
+
+    private fun refreshActiveTasks() {
+        val activeTasks = tasks.values.filter { it.status == ShellTaskStatus.Queued || it.status == ShellTaskStatus.Running }
+        activeTasks.forEach { task ->
+            runCatching {
+                val result = executor.statusTask(task.taskId)
+                val callback = if (result.accepted) result.awaitCallback(REFRESH_CALLBACK_TIMEOUT_MS) else null
+                if (callback == null) {
+                    tasks[task.taskId] = task.copy(lastRequestId = result.requestId)
+                    return@runCatching
+                }
+                val parsed = callback.stdout?.parseKeyValueLines().orEmpty()
+                val updatedStatus = inferStatus(
+                    current = task.status,
+                    termuxStatus = parsed["status"],
+                    running = parsed["running"]?.toBooleanStrictOrNull(),
+                    exitCode = parsed["exitCode"]?.takeIf { it.isNotBlank() }?.toIntOrNull()
+                )
+                val updated = task.copy(
+                    status = updatedStatus,
+                    updatedAt = Instant.now(),
+                    lastRequestId = result.requestId
+                )
+                tasks[task.taskId] = updated
+                if (updated.status.isTerminal()) {
+                    taskLimiter.unregister(task.taskId)
+                }
+            }
+        }
+    }
+
+    private fun staleStatusMessage(taskId: String): String =
+        "Task status/log query failed; cached status may be stale. In Termux, check: cat ~/.taskshell/tasks/$taskId/status && tail -100 ~/.taskshell/tasks/$taskId/stdout.log"
+
+    private fun requireSafeTaskId(taskId: String): String {
+        require(Regex("^[a-zA-Z0-9_.-]{1,80}$").matches(taskId)) { "Invalid taskId" }
+        return taskId
+    }
+
+    private fun ShellTaskStatus.isTerminal(): Boolean =
+        this == ShellTaskStatus.Finished || this == ShellTaskStatus.Failed || this == ShellTaskStatus.Stopped
 
     private fun String.extractEmbeddedStdout(): String? {
         // Fallback for Termux versions that return a nested Bundle only as a flattened raw string.
@@ -285,5 +372,9 @@ class ShellTaskManager(
         private const val START_CALLBACK_TIMEOUT_MS = 800L
         private const val QUERY_CALLBACK_TIMEOUT_MS = 2_000L
         private const val RECOVER_CALLBACK_TIMEOUT_MS = 8_000L
+        private const val REFRESH_CALLBACK_TIMEOUT_MS = 500L
+        private const val MAX_EXEC_WAIT_TIMEOUT_MS = 30_000L
+        private const val EXEC_POLL_INTERVAL_MS = 250L
+        private const val MAX_EXEC_INLINE_LOG_LINES = 500
     }
 }

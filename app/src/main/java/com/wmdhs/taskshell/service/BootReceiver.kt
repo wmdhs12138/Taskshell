@@ -8,6 +8,8 @@ import android.os.Build
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        ServiceEventLogger.init(context.applicationContext)
+        ServiceEventLogger.record("boot_completed")
         val serviceIntent = Intent(context, TaskshellForegroundService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(serviceIntent)
