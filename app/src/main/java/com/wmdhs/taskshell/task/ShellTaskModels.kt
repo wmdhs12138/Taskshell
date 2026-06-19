@@ -13,6 +13,13 @@ data class ShellTask(
     val lastRequestId: String? = null
 )
 
+
+data class ShellTaskInput(
+    val env: Map<String, String> = emptyMap(),
+    val stdin: String? = null,
+    val timeoutMillis: Long? = null
+)
+
 enum class ShellTaskStatus {
     Queued,
     Running,
@@ -26,5 +33,7 @@ data class ShellExecResult(
     val task: ShellTask,
     val stdout: String? = null,
     val stderr: String? = null,
-    val exitCode: Int? = null
+    val exitCode: Int? = null,
+    val stdoutTruncated: Boolean = false,
+    val stderrTruncated: Boolean = false
 )

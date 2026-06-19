@@ -13,32 +13,37 @@ class ShellTaskManager(
     private val commandPolicy = CommandPolicy()
     private val taskLimiter = TaskLimiter()
 
-    fun exec(command: String, workingDirectory: String?, waitMillis: Long): ShellExecResult {
-        val task = start(command, workingDirectory)
+    fun exec(command: String, workingDirectory: String?, waitMillis: Long, input: ShellTaskInput = ShellTaskInput()): ShellExecResult {
+        val task = start(command, workingDirectory, input)
         return waitForShortTask(task, waitMillis)
     }
 
-    fun execPublic(command: String, workingDirectory: String?, waitMillis: Long): PublicShellExecResult {
-        val result = exec(command, workingDirectory, waitMillis)
+    fun execPublic(command: String, workingDirectory: String?, waitMillis: Long, input: ShellTaskInput = ShellTaskInput()): PublicShellExecResult {
+        val result = exec(command, workingDirectory, waitMillis, input)
         return if (result.mode == "foreground") {
             PublicShellExecResult(
                 status = result.task.status.publicName(),
                 taskId = result.task.taskId,
                 exitCode = result.exitCode,
                 stdout = result.stdout,
-                stderr = result.stderr
+                stderr = result.stderr,
+                stdoutTruncated = result.stdoutTruncated,
+                stderrTruncated = result.stderrTruncated,
+                nextActions = nextActionsFor(result.task.status)
             )
         } else {
             PublicShellExecResult(
                 status = result.task.status.publicName(),
                 taskId = result.task.taskId,
-                message = "Command is still running. Use shell_task_status or shell_task_logs to continue."
+                message = "Command is still running. Use shell_task_status or shell_task_logs to continue.",
+                nextActions = nextActionsFor(result.task.status)
             )
         }
     }
 
     @Synchronized
-    fun start(command: String, workingDirectory: String?): ShellTask {
+    fun start(command: String, workingDirectory: String?, input: ShellTaskInput = ShellTaskInput()): ShellTask {
+        validateInput(input)
         refreshActiveTasks()
         taskLimiter.cleanupFinished(tasks)
         val policy = commandPolicy.validate(command, workingDirectory)
@@ -48,7 +53,7 @@ class ShellTaskManager(
 
         val now = Instant.now()
         val taskId = newTaskId()
-        val result = executor.startTask(taskId, command, workingDirectory)
+        val result = executor.startTask(taskId, command, workingDirectory, input)
         val callback = result.awaitCallback(START_CALLBACK_TIMEOUT_MS)
         val task = ShellTask(
             taskId = taskId,
@@ -82,6 +87,8 @@ class ShellTaskManager(
         val statusFromTermux = parsed["status"]
         val running = parsed["running"]?.toBooleanStrictOrNull()
         val exitCode = parsed["exitCode"]?.takeIf { it.isNotBlank() }?.toIntOrNull()
+        val startedAt = parsed["startedAt"]?.takeIf { it.isNotBlank() }?.toLongOrNull()
+        val endedAt = parsed["endedAt"]?.takeIf { it.isNotBlank() }?.toLongOrNull()
         val updated = if (queryFailed) {
             task.copy(lastRequestId = result.requestId)
         } else {
@@ -106,28 +113,41 @@ class ShellTaskManager(
             "message" to if (queryFailed) staleStatusMessage(taskId) else null,
             "stdout" to callback?.stdout,
             "stderr" to callback?.stderr,
-            "exitCode" to callback?.exitCode,
+            "exitCode" to (callback?.exitCode ?: exitCode),
+            "running" to running,
+            "startedAtEpoch" to startedAt,
+            "endedAtEpoch" to endedAt,
             "parsed" to parsed,
             "rawExtras" to callback?.rawExtras,
             "error" to (result.error ?: if (queryFailed) "Status query did not return a callback before timeout" else null)
         )
     }
 
-    fun statusPublic(taskId: String): PublicTaskStatusResult {
+    fun statusPublic(taskId: String, includeCommand: Boolean = false): PublicTaskStatusResult {
         return try {
             val details = statusDetails(taskId)
             val task = details["task"] as? ShellTask ?: status(taskId)
             val exitCode = details["exitCode"] as? Int
             val queryFailed = details["queryFailed"] as? Boolean ?: false
+            val startedAtEpoch = details["startedAtEpoch"] as? Long
+            val endedAtEpoch = details["endedAtEpoch"] as? Long
             PublicTaskStatusResult(
                 taskId = task.taskId,
                 status = if (queryFailed) "unknown" else task.status.publicName(),
-                command = task.command,
+                command = task.command.takeIf { includeCommand },
+                commandPreview = task.command.preview(),
+                commandLength = task.command.length,
+                commandSha256 = task.command.sha256(),
                 cwd = task.workingDirectory,
                 createdAt = task.createdAt.toIsoString(),
                 updatedAt = task.updatedAt.toIsoString(),
+                startedAt = startedAtEpoch?.let { Instant.ofEpochSecond(it).toIsoString() },
+                endedAt = endedAtEpoch?.let { Instant.ofEpochSecond(it).toIsoString() },
+                durationMillis = if (startedAtEpoch != null && endedAtEpoch != null) (endedAtEpoch - startedAtEpoch) * 1000 else null,
+                running = details["running"] as? Boolean,
                 exitCode = exitCode,
-                message = if (queryFailed) "Task status is temporarily unavailable. Try again later or call shell_task_recover." else null
+                message = if (queryFailed) "Task status is temporarily unavailable. Try again later or call shell_task_recover." else null,
+                nextActions = nextActionsFor(task.status)
             )
         } catch (throwable: Throwable) {
             PublicTaskStatusResult(
@@ -142,12 +162,14 @@ class ShellTaskManager(
         }
     }
 
-    fun logs(taskId: String, maxLines: Int): Map<String, Any?> {
+    fun logs(taskId: String, maxLines: Int, maxBytes: Int = DEFAULT_MAX_LOG_BYTES): Map<String, Any?> {
         val task = status(taskId)
-        val result = executor.logsTask(taskId, maxLines)
+        val coercedMaxBytes = maxBytes.coerceIn(1024, MAX_LOG_BYTES)
+        val result = executor.logsTask(taskId, maxLines, coercedMaxBytes)
         val callback = if (result.accepted) result.awaitCallback(QUERY_CALLBACK_TIMEOUT_MS) else null
         val queryFailed = !result.accepted || callback == null
         val parsed = callback?.stdout?.parseKeyValueLines().orEmpty()
+        val parsedLogs = callback?.stdout?.parseTaskLogs() ?: ParsedTaskLogs()
         val statusFromTermux = parsed["status"]
         val exitCodeFromTermux = parsed["exitCode"]?.takeIf { it.isNotBlank() }?.toIntOrNull()
         val updated = if (queryFailed) {
@@ -167,6 +189,7 @@ class ShellTaskManager(
             "taskId" to task.taskId,
             "status" to updated.status.name,
             "maxLines" to maxLines.coerceIn(1, 5000),
+            "maxBytes" to coercedMaxBytes,
             "accepted" to result.accepted,
             "transport" to result.transport,
             "requestId" to result.requestId,
@@ -174,8 +197,10 @@ class ShellTaskManager(
             "queryFailed" to queryFailed,
             "stale" to queryFailed,
             "message" to if (queryFailed) staleStatusMessage(taskId) else null,
-            "stdout" to callback?.stdout,
-            "stderr" to callback?.stderr,
+            "stdout" to parsedLogs.stdout,
+            "stderr" to parsedLogs.stderr,
+            "stdoutTruncated" to parsed["stdoutTruncated"].toBooleanLenient(),
+            "stderrTruncated" to parsed["stderrTruncated"].toBooleanLenient(),
             "exitCode" to (callback?.exitCode ?: exitCodeFromTermux),
             "parsed" to parsed,
             "rawExtras" to callback?.rawExtras,
@@ -184,16 +209,21 @@ class ShellTaskManager(
         )
     }
 
-    fun logsPublic(taskId: String, maxLines: Int): PublicTaskLogsResult {
+    fun logsPublic(taskId: String, maxLines: Int, maxBytes: Int = DEFAULT_MAX_LOG_BYTES): PublicTaskLogsResult {
         return try {
-            val details = logs(taskId, maxLines)
+            val details = logs(taskId, maxLines, maxBytes)
             PublicTaskLogsResult(
                 taskId = taskId,
                 status = (details["status"] as? String)?.lowercase() ?: "unknown",
                 stdout = details["stdout"] as? String,
                 stderr = details["stderr"] as? String,
                 exitCode = details["exitCode"] as? Int,
-                message = if (details["queryFailed"] as? Boolean == true) "Task logs are temporarily unavailable. Try again later or call shell_task_recover." else null
+                maxLines = details["maxLines"] as? Int,
+                maxBytes = details["maxBytes"] as? Int,
+                stdoutTruncated = details["stdoutTruncated"] as? Boolean ?: false,
+                stderrTruncated = details["stderrTruncated"] as? Boolean ?: false,
+                message = if (details["queryFailed"] as? Boolean == true) "Task logs are temporarily unavailable. Try again later or call shell_task_recover." else null,
+                nextActions = nextActionsFor((details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() })
             )
         } catch (throwable: Throwable) {
             PublicTaskLogsResult(
@@ -293,7 +323,7 @@ class ShellTaskManager(
         return tasks.values.sortedByDescending { it.createdAt }
     }
 
-    fun listPublic(): List<PublicTaskSummary> = list().map { it.toPublicSummary() }
+    fun listPublic(includeCommand: Boolean = false): List<PublicTaskSummary> = list().map { it.toPublicSummary(includeCommand) }
 
     fun debug(taskId: String): Map<String, Any?> {
         return statusDetails(taskId)
@@ -312,16 +342,18 @@ class ShellTaskManager(
             val details = runCatching { statusDetails(task.taskId) }.getOrNull() ?: break
             latest = details["task"] as? ShellTask ?: latest
             if (latest.status == ShellTaskStatus.Finished || latest.status == ShellTaskStatus.Failed || latest.status == ShellTaskStatus.Stopped) {
-                val logDetails = runCatching { logs(task.taskId, MAX_EXEC_INLINE_LOG_LINES) }.getOrNull()
+                val logDetails = runCatching { logs(task.taskId, MAX_EXEC_INLINE_LOG_LINES, DEFAULT_MAX_LOG_BYTES) }.getOrNull()
                 val stdout = logDetails?.get("stdout") as? String
                 val stderr = logDetails?.get("stderr") as? String
                 val exitCode = logDetails?.get("exitCode") as? Int
                 return ShellExecResult(
                     mode = "foreground",
                     task = latest,
-                    stdout = stdout?.substringAfter("--- stdout ---\n")?.substringBefore("--- stderr ---")?.trimEnd(),
+                    stdout = stdout,
                     stderr = stderr,
-                    exitCode = exitCode
+                    exitCode = exitCode,
+                    stdoutTruncated = logDetails?.get("stdoutTruncated") as? Boolean ?: false,
+                    stderrTruncated = logDetails?.get("stderrTruncated") as? Boolean ?: false
                 )
             }
         }
@@ -358,6 +390,18 @@ class ShellTaskManager(
         }
     }
 
+    private fun validateInput(input: ShellTaskInput) {
+        require(input.env.size <= MAX_ENV_VARS) { "Too many env variables. Max: $MAX_ENV_VARS" }
+        input.env.forEach { (key, value) ->
+            require(ENV_NAME_REGEX.matches(key)) { "Invalid env variable name: $key" }
+            require(value.length <= MAX_ENV_VALUE_LENGTH) { "Env variable value is too long: $key" }
+        }
+        require((input.stdin?.length ?: 0) <= MAX_STDIN_LENGTH) { "stdin is too long. Max length: $MAX_STDIN_LENGTH" }
+        input.timeoutMillis?.let { timeout ->
+            require(timeout in 1..MAX_TASK_TIMEOUT_MS) { "timeoutMillis must be between 1 and $MAX_TASK_TIMEOUT_MS" }
+        }
+    }
+
     private fun staleStatusMessage(taskId: String): String =
         "Task status/log query failed; cached status may be stale. In Termux, check: cat ~/.taskshell/tasks/$taskId/status && tail -100 ~/.taskshell/tasks/$taskId/stdout.log"
 
@@ -378,6 +422,32 @@ class ShellTaskManager(
 
     private fun ShellTaskStatus.isTerminal(): Boolean =
         this == ShellTaskStatus.Finished || this == ShellTaskStatus.Failed || this == ShellTaskStatus.Stopped
+
+    private fun nextActionsFor(status: ShellTaskStatus?): List<String> = when (status) {
+        ShellTaskStatus.Queued, ShellTaskStatus.Running -> listOf("shell_task_status", "shell_task_logs", "shell_task_stop")
+        ShellTaskStatus.Finished, ShellTaskStatus.Failed, ShellTaskStatus.Stopped -> listOf("shell_task_logs")
+        null -> listOf("shell_task_recover")
+    }
+
+    private fun String?.toBooleanLenient(): Boolean = equals("true", ignoreCase = true)
+
+    private data class ParsedTaskLogs(
+        val stdout: String? = null,
+        val stderr: String? = null
+    )
+
+    private fun String.parseTaskLogs(): ParsedTaskLogs {
+        val stdoutMarker = "--- stdout ---\n"
+        val stderrMarker = "--- stderr ---\n"
+        val stdoutStart = indexOf(stdoutMarker)
+        val stderrStart = indexOf(stderrMarker)
+        if (stdoutStart < 0 || stderrStart < 0 || stderrStart < stdoutStart) {
+            return ParsedTaskLogs(stdout = this, stderr = null)
+        }
+        val stdout = substring(stdoutStart + stdoutMarker.length, stderrStart).trimEnd()
+        val stderr = substring(stderrStart + stderrMarker.length).trimEnd()
+        return ParsedTaskLogs(stdout = stdout, stderr = stderr)
+    }
 
     private fun String.extractEmbeddedStdout(): String? {
         // Fallback for Termux versions that return a nested Bundle only as a flattened raw string.
@@ -469,5 +539,12 @@ class ShellTaskManager(
         private const val MAX_EXEC_WAIT_TIMEOUT_MS = 30_000L
         private const val EXEC_POLL_INTERVAL_MS = 250L
         private const val MAX_EXEC_INLINE_LOG_LINES = 500
+        private const val DEFAULT_MAX_LOG_BYTES = 64 * 1024
+        private const val MAX_LOG_BYTES = 1024 * 1024
+        private const val MAX_STDIN_LENGTH = 256 * 1024
+        private const val MAX_ENV_VARS = 64
+        private const val MAX_ENV_VALUE_LENGTH = 8192
+        private const val MAX_TASK_TIMEOUT_MS = 24 * 60 * 60 * 1000L
+        private val ENV_NAME_REGEX = Regex("^[A-Za-z_][A-Za-z0-9_]*$")
     }
 }

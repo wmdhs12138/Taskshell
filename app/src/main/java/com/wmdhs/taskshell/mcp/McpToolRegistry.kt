@@ -5,7 +5,11 @@ import com.wmdhs.taskshell.audit.AuditLogStore
 import com.wmdhs.taskshell.service.ServiceEventLogger
 import com.wmdhs.taskshell.task.ShellExecResult
 import com.wmdhs.taskshell.task.ShellTask
+import com.wmdhs.taskshell.task.ShellTaskInput
 import com.wmdhs.taskshell.task.ShellTaskManager
+import com.wmdhs.taskshell.task.preview
+import com.wmdhs.taskshell.task.redactSensitiveText
+import com.wmdhs.taskshell.task.sha256
 import com.wmdhs.taskshell.task.toPublicSummary
 
 class McpToolRegistry(
@@ -70,19 +74,22 @@ class McpToolRegistry(
             val result = when (name) {
                 "shell_task_start" -> taskManager.start(
                     command = arguments["command"] as? String ?: error("Missing command"),
-                    workingDirectory = arguments.workingDirectory()
-                ).toPublicSummary()
+                    workingDirectory = arguments.workingDirectory(),
+                    input = arguments.taskInput()
+                ).toPublicSummary(includeCommand = arguments.includeCommand())
                 "shell_task_status" -> taskManager.statusPublic(
-                    taskId = arguments["taskId"] as? String ?: error("Missing taskId")
+                    taskId = arguments["taskId"] as? String ?: error("Missing taskId"),
+                    includeCommand = arguments.includeCommand()
                 )
                 "shell_task_logs" -> taskManager.logsPublic(
                     taskId = arguments["taskId"] as? String ?: error("Missing taskId"),
-                    maxLines = (arguments["maxLines"] as? Number)?.toInt() ?: 200
+                    maxLines = (arguments["maxLines"] as? Number)?.toInt() ?: 200,
+                    maxBytes = (arguments["maxBytes"] as? Number)?.toInt() ?: 64 * 1024
                 )
                 "shell_task_stop" -> taskManager.stopPublic(
                     taskId = arguments["taskId"] as? String ?: error("Missing taskId")
                 )
-                "shell_task_list" -> taskManager.listPublic()
+                "shell_task_list" -> taskManager.listPublic(includeCommand = arguments.includeCommand())
                 "shell_task_cleanup" -> taskManager.cleanup(
                     olderThanHours = (arguments["olderThanHours"] as? Number)?.toInt() ?: 24,
                     keepLatest = (arguments["keepLatest"] as? Number)?.toInt() ?: 20,
@@ -95,7 +102,8 @@ class McpToolRegistry(
                 "shell_exec" -> taskManager.execPublic(
                     command = arguments["command"] as? String ?: error("Missing command"),
                     workingDirectory = arguments.workingDirectory(),
-                    waitMillis = (arguments["waitMillis"] as? Number)?.toLong() ?: 10_000L
+                    waitMillis = (arguments["waitMillis"] as? Number)?.toLong() ?: 10_000L,
+                    input = arguments.taskInput()
                 )
                 "audit_logs" -> AuditLogStore.list((arguments["limit"] as? Number)?.toInt() ?: 50)
                 "audit_clear" -> mapOf("cleared" to true).also { AuditLogStore.clear() }
@@ -106,12 +114,15 @@ class McpToolRegistry(
                 AuditLogStore.add(
                     AuditEvent(
                         toolName = name,
-                        command = arguments["command"] as? String,
-                        cwd = arguments["cwd"] as? String,
+                        command = null,
+                        commandPreview = (arguments["command"] as? String)?.preview(),
+                        commandLength = (arguments["command"] as? String)?.length,
+                        commandSha256 = (arguments["command"] as? String)?.sha256(),
+                        cwd = arguments.workingDirectory(),
                         taskId = extractTaskId(result),
                         success = true,
                         durationMillis = System.currentTimeMillis() - startedAt,
-                        resultSummary = summarize(result)
+                        resultSummary = summarize(result).redactForAudit()
                     )
                 )
             }
@@ -121,8 +132,11 @@ class McpToolRegistry(
                 AuditLogStore.add(
                     AuditEvent(
                         toolName = name,
-                        command = arguments["command"] as? String,
-                        cwd = arguments["cwd"] as? String,
+                        command = null,
+                        commandPreview = (arguments["command"] as? String)?.preview(),
+                        commandLength = (arguments["command"] as? String)?.length,
+                        commandSha256 = (arguments["command"] as? String)?.sha256(),
+                        cwd = arguments.workingDirectory(),
                         taskId = arguments["taskId"] as? String,
                         success = false,
                         error = throwable.message ?: throwable::class.java.simpleName,
@@ -155,6 +169,28 @@ class McpToolRegistry(
 
     private fun summarize(result: Any): String {
         return result.toString().take(500)
+    }
+
+    private fun Map<String, Any?>.includeCommand(): Boolean = this["includeCommand"] as? Boolean ?: false
+
+    private fun String.redactForAudit(): String {
+        return redactSensitiveText()
+            .replace(Regex("command=([^,)]{0,500})"), "command=<redacted>")
+            .replace(Regex("transportCommand=([^,)]{0,500})"), "transportCommand=<redacted>")
+            .replace(Regex("command\":\"[^\"]{0,500}\""), "command\":\"<redacted>\"")
+    }
+
+    private fun Map<String, Any?>.taskInput(): ShellTaskInput {
+        val rawEnv = this["env"] as? Map<*, *>
+        val env = rawEnv
+            ?.mapKeys { it.key.toString() }
+            ?.mapValues { it.value?.toString().orEmpty() }
+            ?: emptyMap()
+        return ShellTaskInput(
+            env = env,
+            stdin = this["stdin"] as? String ?: this["input"] as? String,
+            timeoutMillis = (this["timeoutMillis"] as? Number)?.toLong()
+        )
     }
 
     private fun Map<String, Any?>.workingDirectory(): String? {

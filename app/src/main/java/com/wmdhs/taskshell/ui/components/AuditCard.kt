@@ -66,7 +66,7 @@ fun AuditCard(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             Text("Audit logs", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("记录工具调用、命令、taskId、耗时与错误信息。", style = MaterialTheme.typography.bodyMedium)
+            Text("记录工具调用、命令摘要、taskId、耗时与错误信息；默认不保存完整命令。", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(onClick = onLoad) { Text("Load") }
                 OutlinedButton(onClick = onClear) { Text("Clear") }

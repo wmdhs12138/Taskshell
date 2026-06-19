@@ -38,7 +38,7 @@ It exposes a local MCP-compatible HTTP endpoint, forwards tool calls to Termux v
 - Boot receiver skeleton.
 - Basic command safety policy.
 - Concurrent task limiting.
-- Audit logs.
+- Privacy-aware audit logs with command previews, lengths, and hashes instead of full command text by default.
 - Task cleanup tool.
 - Task recovery from Termux task directories after Taskshell restart.
 
@@ -142,10 +142,10 @@ Taskshell uses underscore-only tool names for compatibility with clients that re
 
 | Tool | Description |
 |---|---|
-| `shell_exec` | Run a shell command and return concise stdout, stderr, exit code, and taskId. If it keeps running, return taskId for follow-up. |
-| `shell_task_start` | Start a tmux-backed background task and return a concise task summary. |
-| `shell_task_status` | Query concise task status, timestamps, and exit code when available. |
-| `shell_task_logs` | Read stdout and stderr from a task. |
+| `shell_exec` | Run a short shell command and return concise stdout, stderr, exit code, truncation flags, and taskId. If it keeps running, return taskId for follow-up. Supports `env`, `stdin`/`input`, and `timeoutMillis`. |
+| `shell_task_start` | Start a tmux-backed background task and return a concise task summary. Supports `env`, `stdin`/`input`, `timeoutMillis`, and optional `includeCommand`. |
+| `shell_task_status` | Query concise task status, timestamps, duration, running flag, exit code, and command summary. Full command is returned only when `includeCommand=true`. |
+| `shell_task_logs` | Read split stdout/stderr from a task with `maxLines`, `maxBytes`, and truncation flags. |
 | `shell_task_stop` | Stop a task by killing its tmux session and return concise final status. |
 | `shell_task_list` | List known tasks with concise summaries. |
 | `shell_task_cleanup` | Clean old finished task records and Termux task directories. Maintenance tool; dry-run by default. |
@@ -188,7 +188,10 @@ Example `shell_exec` result for a completed command:
   "taskId": "taskshell_xxxxxxxxxxxxxxxx",
   "exitCode": 0,
   "stdout": "hello",
-  "stderr": ""
+  "stderr": "",
+  "stdoutTruncated": false,
+  "stderrTruncated": false,
+  "nextActions": ["shell_task_logs"]
 }
 ```
 
@@ -198,7 +201,8 @@ Example result when the command continues in background:
 {
   "status": "running",
   "taskId": "taskshell_xxxxxxxxxxxxxxxx",
-  "message": "Command is still running. Use shell_task_status or shell_task_logs to continue."
+  "message": "Command is still running. Use shell_task_status or shell_task_logs to continue.",
+  "nextActions": ["shell_task_status", "shell_task_logs", "shell_task_stop"]
 }
 ```
 
@@ -214,6 +218,21 @@ Example:
 }
 ```
 
+Input options example:
+
+```json
+{
+  "command": "cat; echo FOO=$FOO",
+  "cwd": "/data/data/com.termux/files/home",
+  "env": {
+    "FOO": "bar"
+  },
+  "stdin": "hello from stdin\n",
+  "timeoutMillis": 5000,
+  "waitMillis": 10000
+}
+```
+
 ### `shell_task_start`
 
 Example:
@@ -221,7 +240,8 @@ Example:
 ```json
 {
   "command": "pwd; echo hello from taskshell; date",
-  "cwd": "/data/data/com.termux/files/home"
+  "cwd": "/data/data/com.termux/files/home",
+  "includeCommand": false
 }
 ```
 
@@ -238,7 +258,8 @@ working_dir
 
 ```json
 {
-  "taskId": "taskshell_xxxxxxxxxxxxxxxx"
+  "taskId": "taskshell_xxxxxxxxxxxxxxxx",
+  "includeCommand": false
 }
 ```
 
@@ -247,9 +268,38 @@ working_dir
 ```json
 {
   "taskId": "taskshell_xxxxxxxxxxxxxxxx",
-  "maxLines": 200
+  "maxLines": 200,
+  "maxBytes": 65536
 }
 ```
+
+### Command privacy
+
+Task summaries and status results do not return the full command by default. They return:
+
+```json
+{
+  "command": null,
+  "commandPreview": "echo hello ...",
+  "commandLength": 123,
+  "commandSha256": "..."
+}
+```
+
+Set `includeCommand=true` only when the client really needs the full command text.
+
+### Input limits
+
+Current input-related limits:
+
+| Parameter | Limit |
+|---|---|
+| `env` | Up to 64 variables; names must match `^[A-Za-z_][A-Za-z0-9_]*$`; each value up to 8192 characters. |
+| `stdin` / `input` | Up to 256 KiB. |
+| `timeoutMillis` | `1` to `86400000` ms. Requires `timeout` in Termux; install `coreutils` if unavailable. |
+| `maxLines` | `1` to `5000`. |
+| `maxBytes` | `1024` to `1048576` bytes per output stream. |
+| `waitMillis` | `0` to `30000` ms. |
 
 ### `shell_task_cleanup`
 
@@ -307,6 +357,9 @@ Taskshell is intentionally conservative.
 Current defaults:
 
 - Max command length: `8000` characters.
+- Max stdin/input length: `256 KiB`.
+- Max env variables: `64`; each value up to `8192` characters.
+- Max command timeout: `24 hours`.
 - Allowed working directory prefixes:
   - `/data/data/com.termux/files/home`
   - `/data/data/com.termux/files/usr/tmp`
@@ -402,7 +455,7 @@ Compose BOM: 2024.12.01
 ## Known limitations
 
 - Current MCP transport is a lightweight custom HTTP server, not a full-featured production HTTP stack.
-- Audit logs are currently in-memory.
+- Audit logs are currently in-memory and store command summaries by default, not full command text.
 - Task metadata recovery is partial unless metadata files are added in future versions.
 - Android vendor ROMs may still kill background processes aggressively.
 - Persistent notifications may be hidden or restricted by some vendor notification settings.

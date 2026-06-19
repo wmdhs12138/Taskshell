@@ -4,22 +4,52 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import com.wmdhs.taskshell.task.ShellTaskInput
 import java.util.UUID
 
 class TermuxCommandExecutor(
     private val context: Context
 ) {
-    fun buildStartTaskScript(taskId: String, command: String, workingDirectory: String?): String {
+    fun buildStartTaskScript(taskId: String, command: String, workingDirectory: String?, input: ShellTaskInput = ShellTaskInput()): String {
         val safeTaskId = requireSafeTaskId(taskId)
         val taskDir = "\$HOME/.taskshell/tasks/$safeTaskId"
         val cwdLine = workingDirectory?.let { "cd ${shellQuote(it)}" } ?: "cd \$HOME"
         val commandLiteral = shellQuote(command)
+        val stdinLine = input.stdin?.let { "printf %s ${shellQuote(it)} > \"${'$'}TASK_DIR/stdin.txt\"" }.orEmpty()
+        val envLines = input.env.entries.joinToString("\n") { (key, value) -> "export $key=${shellQuote(value)}" }
+        val timeoutSeconds = input.timeoutMillis
+            ?.takeIf { it > 0 }
+            ?.let { ((it + 999L) / 1000L).coerceIn(1L, 86_400L) }
+            ?: 0L
+        val runCommandBlock = if (timeoutSeconds > 0) {
+            """
+            if command -v timeout >/dev/null 2>&1; then
+              if [ -f "${'$'}TASK_DIR/stdin.txt" ]; then
+                timeout ${timeoutSeconds}s bash -lc $commandLiteral < "${'$'}TASK_DIR/stdin.txt" > "${'$'}TASK_DIR/stdout.log" 2> "${'$'}TASK_DIR/stderr.log"
+              else
+                timeout ${timeoutSeconds}s bash -lc $commandLiteral > "${'$'}TASK_DIR/stdout.log" 2> "${'$'}TASK_DIR/stderr.log"
+              fi
+            else
+              echo "timeout command is unavailable in Termux; install coreutils or omit timeoutMillis" > "${'$'}TASK_DIR/stderr.log"
+              false
+            fi
+            """.trimIndent()
+        } else {
+            """
+            if [ -f "${'$'}TASK_DIR/stdin.txt" ]; then
+              bash -lc $commandLiteral < "${'$'}TASK_DIR/stdin.txt" > "${'$'}TASK_DIR/stdout.log" 2> "${'$'}TASK_DIR/stderr.log"
+            else
+              bash -lc $commandLiteral > "${'$'}TASK_DIR/stdout.log" 2> "${'$'}TASK_DIR/stderr.log"
+            fi
+            """.trimIndent()
+        }
 
         return """
             set -eu
             TASK_ID=${shellQuote(safeTaskId)}
             TASK_DIR="$taskDir"
             mkdir -p "${'$'}TASK_DIR"
+            $stdinLine
             cat > "${'$'}TASK_DIR/command.sh" <<'TASKSHELL_COMMAND_EOF'
             #!/data/data/com.termux/files/usr/bin/bash
             set +e
@@ -36,7 +66,8 @@ class TermuxCommandExecutor(
               echo failed > "${'$'}TASK_DIR/status"
               exit "${'$'}CWD_CODE"
             fi
-            bash -lc $commandLiteral > "${'$'}TASK_DIR/stdout.log" 2> "${'$'}TASK_DIR/stderr.log"
+            $envLines
+            $runCommandBlock
             CODE=${'$'}?
             echo "${'$'}CODE" > "${'$'}TASK_DIR/exit.code"
             date +%s > "${'$'}TASK_DIR/ended_at"
@@ -60,28 +91,49 @@ class TermuxCommandExecutor(
             if tmux has-session -t ${shellQuote(safeTaskId)} 2>/dev/null; then RUNNING=true; else RUNNING=false; fi
             STATUS="unknown"
             EXIT_CODE=""
+            STARTED_AT=""
+            ENDED_AT=""
             [ -f "${'$'}TASK_DIR/status" ] && STATUS="${'$'}(cat "${'$'}TASK_DIR/status")"
             [ -f "${'$'}TASK_DIR/exit.code" ] && EXIT_CODE="${'$'}(cat "${'$'}TASK_DIR/exit.code")"
-            printf 'taskId=%s\nrunning=%s\nstatus=%s\nexitCode=%s\n' ${shellQuote(safeTaskId)} "${'$'}RUNNING" "${'$'}STATUS" "${'$'}EXIT_CODE"
+            [ -f "${'$'}TASK_DIR/started_at" ] && STARTED_AT="${'$'}(cat "${'$'}TASK_DIR/started_at")"
+            [ -f "${'$'}TASK_DIR/ended_at" ] && ENDED_AT="${'$'}(cat "${'$'}TASK_DIR/ended_at")"
+            printf 'taskId=%s\nrunning=%s\nstatus=%s\nexitCode=%s\nstartedAt=%s\nendedAt=%s\n' ${shellQuote(safeTaskId)} "${'$'}RUNNING" "${'$'}STATUS" "${'$'}EXIT_CODE" "${'$'}STARTED_AT" "${'$'}ENDED_AT"
         """.trimIndent().normalizeShellScript()
     }
 
-    fun buildLogsScript(taskId: String, maxLines: Int): String {
+    fun buildLogsScript(taskId: String, maxLines: Int, maxBytes: Int): String {
         val safeTaskId = requireSafeTaskId(taskId)
         val lines = maxLines.coerceIn(1, 5000)
+        val bytes = maxBytes.coerceIn(1024, 1024 * 1024)
         return """
             TASK_DIR="${'$'}HOME/.taskshell/tasks/$safeTaskId"
             STATUS=unknown
             EXIT_CODE=
+            STDOUT_TRUNCATED=false
+            STDERR_TRUNCATED=false
             [ -f "${'$'}TASK_DIR/status" ] && STATUS="${'$'}(cat "${'$'}TASK_DIR/status")"
             [ -f "${'$'}TASK_DIR/exit.code" ] && EXIT_CODE="${'$'}(cat "${'$'}TASK_DIR/exit.code")"
+            if [ -f "${'$'}TASK_DIR/stdout.log" ]; then
+              STDOUT_LINES="${'$'}(wc -l < "${'$'}TASK_DIR/stdout.log" 2>/dev/null || echo 0)"
+              STDOUT_BYTES="${'$'}(wc -c < "${'$'}TASK_DIR/stdout.log" 2>/dev/null || echo 0)"
+              if [ "${'$'}STDOUT_LINES" -gt $lines ] || [ "${'$'}STDOUT_BYTES" -gt $bytes ]; then STDOUT_TRUNCATED=true; fi
+            fi
+            if [ -f "${'$'}TASK_DIR/stderr.log" ]; then
+              STDERR_LINES="${'$'}(wc -l < "${'$'}TASK_DIR/stderr.log" 2>/dev/null || echo 0)"
+              STDERR_BYTES="${'$'}(wc -c < "${'$'}TASK_DIR/stderr.log" 2>/dev/null || echo 0)"
+              if [ "${'$'}STDERR_LINES" -gt $lines ] || [ "${'$'}STDERR_BYTES" -gt $bytes ]; then STDERR_TRUNCATED=true; fi
+            fi
             echo "taskId=$safeTaskId"
             echo "status=${'$'}STATUS"
             echo "exitCode=${'$'}EXIT_CODE"
+            echo "maxLines=$lines"
+            echo "maxBytes=$bytes"
+            echo "stdoutTruncated=${'$'}STDOUT_TRUNCATED"
+            echo "stderrTruncated=${'$'}STDERR_TRUNCATED"
             echo '--- stdout ---'
-            [ -f "${'$'}TASK_DIR/stdout.log" ] && tail -n $lines "${'$'}TASK_DIR/stdout.log" || true
+            [ -f "${'$'}TASK_DIR/stdout.log" ] && tail -n $lines "${'$'}TASK_DIR/stdout.log" | tail -c $bytes || true
             echo '--- stderr ---'
-            [ -f "${'$'}TASK_DIR/stderr.log" ] && tail -n $lines "${'$'}TASK_DIR/stderr.log" || true
+            [ -f "${'$'}TASK_DIR/stderr.log" ] && tail -n $lines "${'$'}TASK_DIR/stderr.log" | tail -c $bytes || true
         """.trimIndent().normalizeShellScript()
     }
 
@@ -175,12 +227,12 @@ class TermuxCommandExecutor(
 
     fun recoverTasks(): TermuxCommandResult = runBashScript(buildRecoverScript())
 
-    fun startTask(taskId: String, command: String, workingDirectory: String?): TermuxCommandResult =
-        runBashScript(buildStartTaskScript(taskId, command, workingDirectory))
+    fun startTask(taskId: String, command: String, workingDirectory: String?, input: ShellTaskInput = ShellTaskInput()): TermuxCommandResult =
+        runBashScript(buildStartTaskScript(taskId, command, workingDirectory, input))
 
     fun statusTask(taskId: String): TermuxCommandResult = runBashScript(buildStatusScript(taskId))
 
-    fun logsTask(taskId: String, maxLines: Int): TermuxCommandResult = runBashScript(buildLogsScript(taskId, maxLines))
+    fun logsTask(taskId: String, maxLines: Int, maxBytes: Int): TermuxCommandResult = runBashScript(buildLogsScript(taskId, maxLines, maxBytes))
 
     fun stopTask(taskId: String): TermuxCommandResult = runBashScript(buildStopScript(taskId))
 

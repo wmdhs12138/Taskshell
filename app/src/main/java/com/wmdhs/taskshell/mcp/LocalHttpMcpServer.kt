@@ -149,8 +149,8 @@ class LocalHttpMcpServer(
                     val json = JSONObject(body.ifBlank { "{}" })
                     val name = json.optString("name")
                     val args = json.optJSONObject("arguments")?.toMap() ?: emptyMap()
-                    require(name.isNotBlank()) { "Missing tool name" }
-                    ok(JSONObject().put("result", registry.callTool(name, args).toJsonValue()))
+                    val result = callToolSafely(name, args)
+                    ok(JSONObject().put("result", result))
                 }
 
                 method == "POST" && path == "/mcp" -> handleJsonRpc(body)
@@ -171,10 +171,18 @@ class LocalHttpMcpServer(
     }
 
     private fun handleJsonRpc(body: String): HttpResponse {
-        val request = JSONObject(body.ifBlank { "{}" })
-        val id = request.opt("id")
+        val request = try {
+            JSONObject(body.ifBlank { "{}" })
+        } catch (throwable: Throwable) {
+            return ok(jsonRpcError(JSONObject.NULL, -32700, "Parse error", throwable.message))
+        }
+        val id = if (request.has("id")) request.opt("id") else JSONObject.NULL
         val method = request.optString("method")
         val params = request.optJSONObject("params") ?: JSONObject()
+
+        if (method.isBlank()) {
+            return ok(jsonRpcError(id, -32600, "Invalid Request", "Missing JSON-RPC method"))
+        }
 
         // JSON-RPC notifications have no id and must not produce a JSON-RPC response.
         // RikkaHub sends this after initialize when using Streamable HTTP.
@@ -201,21 +209,55 @@ class LocalHttpMcpServer(
             "tools/call" -> {
                 val name = params.optString("name")
                 val args = params.optJSONObject("arguments")?.toMap() ?: emptyMap()
-                JSONObject()
-                    .put(
-                        "content",
-                        JSONArray().put(
-                            JSONObject()
-                                .put("type", "text")
-                                .put("text", registry.callTool(name, args).toJsonValue().toString())
-                        )
-                    )
-                    .put("isError", false)
+                callToolSafely(name, args)
             }
 
-            else -> throw IllegalArgumentException("Unsupported JSON-RPC method: $method")
+            else -> return ok(jsonRpcError(id, -32601, "Method not found", "Unsupported JSON-RPC method: $method"))
         }
         return ok(JSONObject().put("jsonrpc", "2.0").put("id", id).put("result", result))
+    }
+
+    private fun callToolSafely(name: String, args: Map<String, Any?>): JSONObject {
+        if (name.isBlank()) {
+            return toolCallError("Missing tool name", "InvalidParams")
+        }
+        return try {
+            toolCallText(registry.callTool(name, args).toJsonValue().toString(), isError = false)
+        } catch (throwable: Throwable) {
+            toolCallError(
+                message = throwable.message ?: throwable::class.java.simpleName,
+                errorType = throwable::class.java.simpleName
+            )
+        }
+    }
+
+    private fun toolCallText(text: String, isError: Boolean): JSONObject = JSONObject()
+        .put(
+            "content",
+            JSONArray().put(
+                JSONObject()
+                    .put("type", "text")
+                    .put("text", text)
+            )
+        )
+        .put("isError", isError)
+
+    private fun toolCallError(message: String, errorType: String): JSONObject {
+        val payload = JSONObject()
+            .put("error", message)
+            .put("type", errorType)
+        return toolCallText(payload.toString(), isError = true)
+    }
+
+    private fun jsonRpcError(id: Any?, code: Int, message: String, details: String? = null): JSONObject {
+        val error = JSONObject()
+            .put("code", code)
+            .put("message", message)
+            .also { if (!details.isNullOrBlank()) it.put("data", details) }
+        return JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("id", id ?: JSONObject.NULL)
+            .put("error", error)
     }
 
     private fun isAuthorized(headers: Map<String, String>): Boolean {
@@ -284,14 +326,20 @@ class LocalHttpMcpServer(
         fun stringProp(description: String) = JSONObject()
             .put("type", "string")
             .put("description", description)
-        fun intProp(description: String, defaultValue: Int? = null) = JSONObject()
+        fun intProp(description: String, defaultValue: Int? = null, minimum: Int? = null, maximum: Int? = null) = JSONObject()
             .put("type", "integer")
             .put("description", description)
             .also { if (defaultValue != null) it.put("default", defaultValue) }
+            .also { if (minimum != null) it.put("minimum", minimum) }
+            .also { if (maximum != null) it.put("maximum", maximum) }
         fun boolProp(description: String, defaultValue: Boolean? = null) = JSONObject()
             .put("type", "boolean")
             .put("description", description)
             .also { if (defaultValue != null) it.put("default", defaultValue) }
+        fun objectProp(description: String, additionalProperties: JSONObject? = null) = JSONObject()
+            .put("type", "object")
+            .put("description", description)
+            .also { if (additionalProperties != null) it.put("additionalProperties", additionalProperties) }
         fun schema(properties: JSONObject, required: List<String> = emptyList()) = JSONObject()
             .put("type", "object")
             .put("properties", properties)
@@ -304,7 +352,11 @@ class LocalHttpMcpServer(
                     .put("command", stringProp("Shell command to execute in Termux."))
                     .put("cwd", stringProp("Working directory. Recommended default: /data/data/com.termux/files/home."))
                     .put("workingDirectory", stringProp("Alias of cwd."))
-                    .put("waitMillis", intProp("Short wait time before returning background task result.", 10000)),
+                    .put("env", objectProp("Environment variables to export before executing the command. Variable names must match ^[A-Za-z_][A-Za-z0-9_]*$.", JSONObject().put("type", "string")))
+                    .put("stdin", stringProp("Optional stdin content passed to the command. Limited to 256 KiB."))
+                    .put("input", stringProp("Alias of stdin."))
+                    .put("timeoutMillis", intProp("Optional command timeout. The task fails if the command exceeds this duration.", null, 1, 86400000))
+                    .put("waitMillis", intProp("Short wait time before returning background task result.", 10000, 0, 30000)),
                 required = listOf("command")
             )
             "shell_task_start" -> schema(
@@ -313,28 +365,38 @@ class LocalHttpMcpServer(
                     .put("cwd", stringProp("Working directory. Use /data/data/com.termux/files/home unless the user requests another allowed Termux path."))
                     .put("workingDirectory", stringProp("Alias of cwd."))
                     .put("workdir", stringProp("Alias of cwd."))
-                    .put("working_dir", stringProp("Alias of cwd.")),
+                    .put("working_dir", stringProp("Alias of cwd."))
+                    .put("env", objectProp("Environment variables to export before executing the command. Variable names must match ^[A-Za-z_][A-Za-z0-9_]*$.", JSONObject().put("type", "string")))
+                    .put("stdin", stringProp("Optional stdin content passed to the command. Limited to 256 KiB."))
+                    .put("input", stringProp("Alias of stdin."))
+                    .put("timeoutMillis", intProp("Optional command timeout. The task fails if the command exceeds this duration.", null, 1, 86400000))
+                    .put("includeCommand", boolProp("Return the full command in the result. Defaults to false; commandPreview, commandLength, and commandSha256 are returned instead.")),
                 required = listOf("command")
             )
             "shell_task_status" -> schema(
-                JSONObject().put("taskId", stringProp("Task id returned by shell_task_start or shell_exec.")),
+                JSONObject()
+                    .put("taskId", stringProp("Task id returned by shell_task_start or shell_exec."))
+                    .put("includeCommand", boolProp("Return the full command in the result. Defaults to false; commandPreview, commandLength, and commandSha256 are returned instead.")),
                 required = listOf("taskId")
             )
             "shell_task_logs" -> schema(
                 JSONObject()
                     .put("taskId", stringProp("Task id returned by shell_task_start or shell_exec."))
-                    .put("maxLines", intProp("Maximum log lines to return.", 200)),
+                    .put("maxLines", intProp("Maximum log lines to return.", 200, 1, 5000))
+                    .put("maxBytes", intProp("Maximum bytes to return for each output stream after line tailing.", 65536, 1024, 1048576)),
                 required = listOf("taskId")
             )
             "shell_task_stop" -> schema(
                 JSONObject().put("taskId", stringProp("Task id to stop.")),
                 required = listOf("taskId")
             )
-            "shell_task_list" -> schema(JSONObject())
+            "shell_task_list" -> schema(
+                JSONObject().put("includeCommand", boolProp("Return full commands in task summaries. Defaults to false."))
+            )
             "shell_task_cleanup" -> schema(
                 JSONObject()
-                    .put("olderThanHours", intProp("Clean finished task directories older than this many hours.", 24))
-                    .put("keepLatest", intProp("Always keep the latest N finished task records/directories.", 20))
+                    .put("olderThanHours", intProp("Clean finished task directories older than this many hours.", 24, 1, 8760))
+                    .put("keepLatest", intProp("Always keep the latest N finished task records/directories.", 20, 0, 500))
                     .put("dryRun", boolProp("Preview cleanup without deleting files.", true))
             )
             "shell_task_recover" -> schema(JSONObject())
