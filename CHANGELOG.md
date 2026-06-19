@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0
+
+Feature release focused on MCP shell tool ergonomics, Ktor/CIO transport, automated tests, and privacy-aware task/audit output.
+
+### Added
+
+- Added structured stdout/stderr log parsing with `maxBytes`, truncation flags, and `nextActions` hints.
+- Added command input options for `shell_exec` and `shell_task_start`: `env`, `stdin`/`input`, and `timeoutMillis`.
+- Added command privacy fields: redacted `commandPreview`, `commandLength`, and `commandSha256`.
+- Added optional `includeCommand` for task start, status, and list results.
+- Added Ktor/CIO MCP HTTP server backend.
+- Added JVM unit tests for command policy, task log parsing, command preview redaction, and hashing helpers.
+
+### Changed
+
+- Switched the active MCP HTTP backend from the custom socket server to Ktor/CIO.
+- Improved MCP tool error semantics so tool failures return `isError=true` instead of surfacing as HTTP 500.
+- Improved JSON-RPC protocol error responses for parse errors, invalid requests, and unknown methods.
+- Improved MCP input schemas with parameter limits and new input/privacy options.
+- Updated README, usage, and architecture documentation for the new tool behavior and test workflow.
+- Audit events now store command summaries by default instead of full command text.
+
+### Fixed
+
+- Fixed task log output so normal results return split stdout/stderr rather than mixed metadata and log sections.
+- Fixed short command output handling to reuse the same structured log parsing path.
+- Fixed failed task reporting to prefer the task exit code over the status/log query command exit code.
+
 ## 1.0.1
 
 Maintenance release covering all changes since the `v1.0.0` automated release build.
