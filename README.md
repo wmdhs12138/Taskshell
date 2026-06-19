@@ -142,16 +142,77 @@ Taskshell uses underscore-only tool names for compatibility with clients that re
 
 | Tool | Description |
 |---|---|
-| `shell_exec` | Start a short shell task. Currently returns background task info. |
-| `shell_task_start` | Start a tmux-backed background task. |
-| `shell_task_status` | Query task status. |
-| `shell_task_logs` | Read task logs. |
-| `shell_task_stop` | Stop a task by killing its tmux session. |
-| `shell_task_list` | List known tasks; auto-recovers when memory cache is empty. |
-| `shell_task_cleanup` | Clean old finished task records and Termux task directories. |
-| `shell_task_recover` | Recover task records from `~/.taskshell/tasks`. |
-| `audit_logs` | List recent in-memory audit events. |
+| `shell_exec` | Run a shell command and return concise stdout, stderr, exit code, and taskId. If it keeps running, return taskId for follow-up. |
+| `shell_task_start` | Start a tmux-backed background task and return a concise task summary. |
+| `shell_task_status` | Query concise task status, timestamps, and exit code when available. |
+| `shell_task_logs` | Read stdout and stderr from a task. |
+| `shell_task_stop` | Stop a task by killing its tmux session and return concise final status. |
+| `shell_task_list` | List known tasks with concise summaries. |
+| `shell_task_cleanup` | Clean old finished task records and Termux task directories. Maintenance tool; dry-run by default. |
+| `shell_task_recover` | Recover task records from `~/.taskshell/tasks`. Use after service restart or missing task records. |
+| `shell_task_debug` | Advanced per-task diagnostics, including Termux transport and raw callback details. Use only when normal task tools fail. |
+| `audit_logs` | List recent in-memory audit events for troubleshooting. |
 | `audit_clear` | Clear in-memory audit events. |
+| `service_diagnostics` | Advanced service lifecycle and Termux transport diagnostics. Use only when normal tools fail. |
+
+### MCP output design
+
+Taskshell separates normal task results from diagnostics.
+
+Normal tools return concise, stable, task-oriented results and avoid exposing Termux transport internals:
+
+```text
+shell_exec
+shell_task_start
+shell_task_status
+shell_task_logs
+shell_task_stop
+shell_task_list
+```
+
+Diagnostic tools are intended for troubleshooting and may expose implementation details:
+
+```text
+shell_task_debug
+shell_task_recover
+shell_task_cleanup
+audit_logs
+service_diagnostics
+```
+
+Example `shell_exec` result for a completed command:
+
+```json
+{
+  "status": "finished",
+  "taskId": "taskshell_xxxxxxxxxxxxxxxx",
+  "exitCode": 0,
+  "stdout": "hello",
+  "stderr": ""
+}
+```
+
+Example result when the command continues in background:
+
+```json
+{
+  "status": "running",
+  "taskId": "taskshell_xxxxxxxxxxxxxxxx",
+  "message": "Command is still running. Use shell_task_status or shell_task_logs to continue."
+}
+```
+
+### `shell_exec`
+
+Example:
+
+```json
+{
+  "command": "echo hello",
+  "cwd": "/data/data/com.termux/files/home",
+  "waitMillis": 10000
+}
+```
 
 ### `shell_task_start`
 
@@ -292,13 +353,7 @@ After reopening Taskshell, use:
 shell_task_recover
 ```
 
-or call:
-
-```text
-shell_task_list
-```
-
-which attempts recovery if the in-memory task cache is empty.
+or call `shell_task_recover` explicitly before querying older task IDs.
 
 Recovered tasks may show:
 

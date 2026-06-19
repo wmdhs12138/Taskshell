@@ -37,18 +37,67 @@ Use **Copy header** in Taskshell. RikkaHub is one supported client; other Stream
 
 ## 4. Test command
 
-Ask your MCP client to call `shell_task_start`:
+Ask your MCP client to call `shell_exec` for short commands:
 
 ```json
 {
   "command": "pwd; echo hello; date",
+  "cwd": "/data/data/com.termux/files/home",
+  "waitMillis": 10000
+}
+```
+
+Expected concise result:
+
+```json
+{
+  "status": "finished",
+  "taskId": "taskshell_xxxxxxxxxxxxxxxx",
+  "exitCode": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+For long-running commands, call `shell_task_start`:
+
+```json
+{
+  "command": "sleep 20 && echo done",
   "cwd": "/data/data/com.termux/files/home"
 }
 ```
 
-Then call `shell_task_logs` with the returned taskId.
+Then use the returned `taskId` with:
 
-## 5. Check Termux manually
+- `shell_task_status`
+- `shell_task_logs`
+- `shell_task_stop`
+
+## 5. Output and diagnostics
+
+Normal tools return concise, stable results:
+
+```text
+shell_exec
+shell_task_start
+shell_task_status
+shell_task_logs
+shell_task_stop
+shell_task_list
+```
+
+Troubleshooting tools may expose Termux transport details and should be used only when normal tools fail:
+
+```text
+shell_task_debug
+shell_task_recover
+shell_task_cleanup
+audit_logs
+service_diagnostics
+```
+
+## 6. Check Termux manually
 
 ```bash
 ls -R ~/.taskshell/tasks

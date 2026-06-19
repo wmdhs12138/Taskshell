@@ -6,6 +6,7 @@ import com.wmdhs.taskshell.service.ServiceEventLogger
 import com.wmdhs.taskshell.task.ShellExecResult
 import com.wmdhs.taskshell.task.ShellTask
 import com.wmdhs.taskshell.task.ShellTaskManager
+import com.wmdhs.taskshell.task.toPublicSummary
 
 class McpToolRegistry(
     private val taskManager: ShellTaskManager
@@ -13,39 +14,43 @@ class McpToolRegistry(
     private val tools = listOf(
         McpTool(
             name = "shell_exec",
-            description = "Run a shell command as a short task. If it does not finish quickly, return a task id."
+            description = "Run a shell command in Termux. Returns concise stdout, stderr, exit code, and taskId; if the command keeps running, returns the taskId for follow-up."
         ),
         McpTool(
             name = "shell_task_start",
-            description = "Start a shell command as a background task."
+            description = "Start a shell command as a background task. Returns a concise task summary for follow-up with shell_task_status or shell_task_logs."
         ),
         McpTool(
             name = "shell_task_status",
-            description = "Get background task status."
+            description = "Get the current status of a background shell task by taskId. Returns a concise status, timestamps, and exit code when available."
         ),
         McpTool(
             name = "shell_task_logs",
-            description = "Read background task logs."
+            description = "Read stdout and stderr from a background shell task by taskId."
         ),
         McpTool(
             name = "shell_task_stop",
-            description = "Stop a background task."
+            description = "Stop a background shell task by taskId and return the final concise status."
         ),
         McpTool(
             name = "shell_task_list",
-            description = "List known background tasks."
+            description = "List known shell tasks with concise task summaries."
         ),
         McpTool(
             name = "shell_task_cleanup",
-            description = "Cleanup finished task records and old Termux task directories."
+            description = "Cleanup finished task records and old Termux task directories. Intended for maintenance; dryRun defaults to true."
         ),
         McpTool(
             name = "shell_task_recover",
-            description = "Recover known task records from Termux ~/.taskshell/tasks directories."
+            description = "Recover known task records from Termux ~/.taskshell/tasks directories. Use after service restart or when a task is missing from app memory."
+        ),
+        McpTool(
+            name = "shell_task_debug",
+            description = "Advanced diagnostics for a task, including Termux transport metadata and raw callback details. Use only when normal task tools fail."
         ),
         McpTool(
             name = "audit_logs",
-            description = "List recent Taskshell audit events."
+            description = "List recent Taskshell audit events for troubleshooting."
         ),
         McpTool(
             name = "audit_clear",
@@ -53,7 +58,7 @@ class McpToolRegistry(
         ),
         McpTool(
             name = "service_diagnostics",
-            description = "Show Taskshell process lifecycle diagnostics and recent service event log."
+            description = "Advanced diagnostics for troubleshooting Taskshell service lifecycle and Termux transport. Use only when normal tools fail."
         )
     )
 
@@ -66,25 +71,28 @@ class McpToolRegistry(
                 "shell_task_start" -> taskManager.start(
                     command = arguments["command"] as? String ?: error("Missing command"),
                     workingDirectory = arguments.workingDirectory()
-                )
-                "shell_task_status" -> taskManager.statusDetails(
+                ).toPublicSummary()
+                "shell_task_status" -> taskManager.statusPublic(
                     taskId = arguments["taskId"] as? String ?: error("Missing taskId")
                 )
-                "shell_task_logs" -> taskManager.logs(
+                "shell_task_logs" -> taskManager.logsPublic(
                     taskId = arguments["taskId"] as? String ?: error("Missing taskId"),
                     maxLines = (arguments["maxLines"] as? Number)?.toInt() ?: 200
                 )
-                "shell_task_stop" -> taskManager.stop(
+                "shell_task_stop" -> taskManager.stopPublic(
                     taskId = arguments["taskId"] as? String ?: error("Missing taskId")
                 )
-                "shell_task_list" -> taskManager.list()
+                "shell_task_list" -> taskManager.listPublic()
                 "shell_task_cleanup" -> taskManager.cleanup(
                     olderThanHours = (arguments["olderThanHours"] as? Number)?.toInt() ?: 24,
                     keepLatest = (arguments["keepLatest"] as? Number)?.toInt() ?: 20,
                     dryRun = arguments["dryRun"] as? Boolean ?: true
                 )
                 "shell_task_recover" -> taskManager.recover()
-                "shell_exec" -> taskManager.exec(
+                "shell_task_debug" -> taskManager.debug(
+                    taskId = arguments["taskId"] as? String ?: error("Missing taskId")
+                )
+                "shell_exec" -> taskManager.execPublic(
                     command = arguments["command"] as? String ?: error("Missing command"),
                     workingDirectory = arguments.workingDirectory(),
                     waitMillis = (arguments["waitMillis"] as? Number)?.toLong() ?: 10_000L
@@ -94,7 +102,7 @@ class McpToolRegistry(
                 "service_diagnostics" -> ServiceEventLogger.diagnostics()
                 else -> error("Unknown tool: $name")
             }
-            if (!name.startsWith("audit.")) {
+            if (shouldAudit(name)) {
                 AuditLogStore.add(
                     AuditEvent(
                         toolName = name,
@@ -109,7 +117,7 @@ class McpToolRegistry(
             }
             result
         } catch (throwable: Throwable) {
-            if (!name.startsWith("audit.")) {
+            if (shouldAudit(name)) {
                 AuditLogStore.add(
                     AuditEvent(
                         toolName = name,
@@ -126,6 +134,8 @@ class McpToolRegistry(
         }
     }
 
+    private fun shouldAudit(name: String): Boolean = name !in setOf("audit_logs")
+
     private fun extractTaskId(result: Any): String? {
         return when (result) {
             is ShellTask -> result.taskId
@@ -135,7 +145,11 @@ class McpToolRegistry(
                     ?: (result["task"] as? ShellTask)?.taskId
                     ?: ((result["task"] as? Map<*, *>)?.get("taskId") as? String)
             }
-            else -> null
+            else -> runCatching {
+                val field = result::class.java.declaredFields.firstOrNull { it.name == "taskId" } ?: return@runCatching null
+                field.isAccessible = true
+                field.get(result) as? String
+            }.getOrNull()
         }
     }
 

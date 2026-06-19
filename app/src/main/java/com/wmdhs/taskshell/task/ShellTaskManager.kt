@@ -18,6 +18,25 @@ class ShellTaskManager(
         return waitForShortTask(task, waitMillis)
     }
 
+    fun execPublic(command: String, workingDirectory: String?, waitMillis: Long): PublicShellExecResult {
+        val result = exec(command, workingDirectory, waitMillis)
+        return if (result.mode == "foreground") {
+            PublicShellExecResult(
+                status = result.task.status.publicName(),
+                taskId = result.task.taskId,
+                exitCode = result.exitCode,
+                stdout = result.stdout,
+                stderr = result.stderr
+            )
+        } else {
+            PublicShellExecResult(
+                status = result.task.status.publicName(),
+                taskId = result.task.taskId,
+                message = "Command is still running. Use shell_task_status or shell_task_logs to continue."
+            )
+        }
+    }
+
     @Synchronized
     fun start(command: String, workingDirectory: String?): ShellTask {
         refreshActiveTasks()
@@ -94,6 +113,35 @@ class ShellTaskManager(
         )
     }
 
+    fun statusPublic(taskId: String): PublicTaskStatusResult {
+        return try {
+            val details = statusDetails(taskId)
+            val task = details["task"] as? ShellTask ?: status(taskId)
+            val exitCode = details["exitCode"] as? Int
+            val queryFailed = details["queryFailed"] as? Boolean ?: false
+            PublicTaskStatusResult(
+                taskId = task.taskId,
+                status = if (queryFailed) "unknown" else task.status.publicName(),
+                command = task.command,
+                cwd = task.workingDirectory,
+                createdAt = task.createdAt.toIsoString(),
+                updatedAt = task.updatedAt.toIsoString(),
+                exitCode = exitCode,
+                message = if (queryFailed) "Task status is temporarily unavailable. Try again later or call shell_task_recover." else null
+            )
+        } catch (throwable: Throwable) {
+            PublicTaskStatusResult(
+                taskId = taskId,
+                status = "unknown",
+                command = null,
+                cwd = null,
+                createdAt = "",
+                updatedAt = "",
+                message = publicErrorMessage(throwable, taskId)
+            )
+        }
+    }
+
     fun logs(taskId: String, maxLines: Int): Map<String, Any?> {
         val task = status(taskId)
         val result = executor.logsTask(taskId, maxLines)
@@ -136,6 +184,26 @@ class ShellTaskManager(
         )
     }
 
+    fun logsPublic(taskId: String, maxLines: Int): PublicTaskLogsResult {
+        return try {
+            val details = logs(taskId, maxLines)
+            PublicTaskLogsResult(
+                taskId = taskId,
+                status = (details["status"] as? String)?.lowercase() ?: "unknown",
+                stdout = details["stdout"] as? String,
+                stderr = details["stderr"] as? String,
+                exitCode = details["exitCode"] as? Int,
+                message = if (details["queryFailed"] as? Boolean == true) "Task logs are temporarily unavailable. Try again later or call shell_task_recover." else null
+            )
+        } catch (throwable: Throwable) {
+            PublicTaskLogsResult(
+                taskId = taskId,
+                status = "unknown",
+                message = publicErrorMessage(throwable, taskId)
+            )
+        }
+    }
+
     fun stop(taskId: String): ShellTask {
         val current = status(taskId)
         val result = executor.stopTask(taskId)
@@ -148,6 +216,15 @@ class ShellTaskManager(
         tasks[taskId] = stopped
         taskLimiter.unregister(taskId)
         return stopped
+    }
+
+    fun stopPublic(taskId: String): PublicTaskStopResult {
+        val stopped = stop(taskId)
+        return PublicTaskStopResult(
+            taskId = stopped.taskId,
+            status = stopped.status.publicName(),
+            updatedAt = stopped.updatedAt.toIsoString()
+        )
     }
 
     fun recover(): Map<String, Any?> {
@@ -216,6 +293,12 @@ class ShellTaskManager(
         return tasks.values.sortedByDescending { it.createdAt }
     }
 
+    fun listPublic(): List<PublicTaskSummary> = list().map { it.toPublicSummary() }
+
+    fun debug(taskId: String): Map<String, Any?> {
+        return statusDetails(taskId)
+    }
+
     private fun waitForShortTask(task: ShellTask, waitMillis: Long): ShellExecResult {
         val timeout = waitMillis.coerceIn(0L, MAX_EXEC_WAIT_TIMEOUT_MS)
         if (timeout == 0L || task.status == ShellTaskStatus.Failed) {
@@ -277,6 +360,16 @@ class ShellTaskManager(
 
     private fun staleStatusMessage(taskId: String): String =
         "Task status/log query failed; cached status may be stale. In Termux, check: cat ~/.taskshell/tasks/$taskId/status && tail -100 ~/.taskshell/tasks/$taskId/stdout.log"
+
+    private fun publicErrorMessage(throwable: Throwable, taskId: String): String {
+        return when {
+            throwable.message?.contains("Task not found", ignoreCase = true) == true ->
+                "Task not found. Call shell_task_recover if the service was restarted."
+            throwable.message?.contains("Invalid taskId", ignoreCase = true) == true ->
+                "Invalid taskId: $taskId."
+            else -> throwable.message ?: throwable::class.java.simpleName
+        }
+    }
 
     private fun requireSafeTaskId(taskId: String): String {
         require(Regex("^[a-zA-Z0-9_.-]{1,80}$").matches(taskId)) { "Invalid taskId" }

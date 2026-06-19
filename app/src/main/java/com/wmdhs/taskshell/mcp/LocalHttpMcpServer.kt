@@ -248,7 +248,7 @@ class LocalHttpMcpServer(
         writer.write("Content-Length: ${bytes.size}\r\n")
         writer.write("Access-Control-Allow-Origin: *\r\n")
         writer.write("Access-Control-Allow-Methods: GET,POST,OPTIONS\r\n")
-        writer.write("Access-Control-Allow-Headers: content-type,authorization\r\n")
+        writer.write("Access-Control-Allow-Headers: content-type,authorization,x-taskshell-token\r\n")
         writer.write("Connection: close\r\n")
         writer.write("\r\n")
         writer.flush()
@@ -338,6 +338,10 @@ class LocalHttpMcpServer(
                     .put("dryRun", boolProp("Preview cleanup without deleting files.", true))
             )
             "shell_task_recover" -> schema(JSONObject())
+            "shell_task_debug" -> schema(
+                JSONObject().put("taskId", stringProp("Task id to inspect with advanced diagnostics.")),
+                required = listOf("taskId")
+            )
             "audit_logs" -> schema(
                 JSONObject().put("limit", intProp("Maximum audit events to return.", 50))
             )
