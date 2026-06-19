@@ -11,7 +11,7 @@ class McpServer(context: Context) {
     )
     private val tokenManager = TokenManager(context.applicationContext)
     private val registry = McpToolRegistry(taskManager)
-    private val httpServer = LocalHttpMcpServer(
+    private val httpServer = KtorHttpMcpServer(
         registry = registry,
         tokenProvider = { tokenManager.getOrCreateToken() }
     )

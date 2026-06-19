@@ -27,7 +27,7 @@ It exposes a local MCP-compatible HTTP endpoint, forwards tool calls to Termux v
 ## Features
 
 - Android native app written in **Kotlin + Jetpack Compose**.
-- Local-only MCP HTTP server:
+- Local-only MCP HTTP server using Ktor/CIO:
   - `http://127.0.0.1:8765/mcp`
 - API Token authentication.
 - Termux integration through `com.termux.RUN_COMMAND`.
@@ -419,6 +419,18 @@ because older task directories do not yet store structured metadata.
 
 ---
 
+## Testing
+
+Run JVM unit tests and Android lint:
+
+```bash
+gradle testDebugUnitTest lintDebug
+```
+
+Current unit tests cover command policy basics, task log parsing, and command preview/hash helpers.
+
+---
+
 ## Build from source
 
 Requirements:
@@ -454,7 +466,6 @@ Compose BOM: 2024.12.01
 
 ## Known limitations
 
-- Current MCP transport is a lightweight custom HTTP server, not a full-featured production HTTP stack.
 - Audit logs are currently in-memory and store command summaries by default, not full command text.
 - Task metadata recovery is partial unless metadata files are added in future versions.
 - Android vendor ROMs may still kill background processes aggressively.
@@ -486,7 +497,6 @@ See [SECURITY.md](SECURITY.md).
 - Store structured task metadata.
 - Improve recovery fidelity.
 - Add configurable task limits and policies in UI.
-- Optional Ktor/CIO HTTP backend.
 - Better MCP Streamable HTTP compatibility tests.
 - Signed release workflow.
 

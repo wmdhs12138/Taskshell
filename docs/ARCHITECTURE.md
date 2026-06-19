@@ -16,7 +16,9 @@ Taskshell has five main layers.
 
 `TaskshellForegroundService` owns the MCP server lifecycle and shows a foreground service notification.
 
-## 3. MCP` implements a lightweight local JSON-RPC HTTP server bound to `127.0.0.1:8765`.
+## 3. MCP HTTP server
+
+`KtorHttpMcpServer` implements the local JSON-RPC HTTP server bound to `127.0.0.1:8765` using Ktor/CIO. `LocalHttpMcpServer` remains in the source tree as the previous lightweight socket implementation for reference/fallback work.
 
 Supported methods include:
 
