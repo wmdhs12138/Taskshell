@@ -113,7 +113,9 @@ class ShellTaskManager(
             "message" to if (queryFailed) staleStatusMessage(taskId) else null,
             "stdout" to callback?.stdout,
             "stderr" to callback?.stderr,
-            "exitCode" to (callback?.exitCode ?: exitCode),
+            // Prefer the task exit code parsed from Termux task files. callback.exitCode is only the
+            // status-query command exit code and is usually 0 even when the task itself failed.
+            "exitCode" to (exitCode ?: callback?.exitCode),
             "running" to running,
             "startedAtEpoch" to startedAt,
             "endedAtEpoch" to endedAt,
@@ -201,7 +203,9 @@ class ShellTaskManager(
             "stderr" to parsedLogs.stderr,
             "stdoutTruncated" to parsed["stdoutTruncated"].toBooleanLenient(),
             "stderrTruncated" to parsed["stderrTruncated"].toBooleanLenient(),
-            "exitCode" to (callback?.exitCode ?: exitCodeFromTermux),
+            // Prefer the task exit code parsed from Termux task files. callback.exitCode is only the
+            // log-query command exit code and is usually 0 even when the task itself failed.
+            "exitCode" to (exitCodeFromTermux ?: callback?.exitCode),
             "parsed" to parsed,
             "rawExtras" to callback?.rawExtras,
             "command" to result.command,
