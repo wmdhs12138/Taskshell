@@ -10,6 +10,7 @@ class ShellTaskManager(
     private val executor: TermuxCommandExecutor
 ) {
     private val tasks = ConcurrentHashMap<String, ShellTask>()
+    private val lastPublicStatusQueryAt = ConcurrentHashMap<String, Long>()
     private val commandPolicy = CommandPolicy()
     private val taskLimiter = TaskLimiter()
 
@@ -24,6 +25,8 @@ class ShellTaskManager(
             PublicShellExecResult(
                 status = result.task.status.publicName(),
                 taskId = result.task.taskId,
+                displayTitle = "执行 Termux 命令",
+                displaySummary = result.task.displaySummary(),
                 exitCode = result.exitCode,
                 stdout = result.stdout,
                 stderr = result.stderr,
@@ -35,8 +38,12 @@ class ShellTaskManager(
             PublicShellExecResult(
                 status = result.task.status.publicName(),
                 taskId = result.task.taskId,
-                message = "Command is still running. Use shell_task_status or shell_task_logs to continue.",
-                nextActions = nextActionsFor(result.task.status)
+                displayTitle = "执行 Termux 命令",
+                displaySummary = result.task.displaySummary(),
+                message = result.task.status.pollingMessage(),
+                nextActions = nextActionsFor(result.task.status),
+                pollAfterMillis = result.task.status.pollAfterMillis(),
+                recommendedNextCheckAt = result.task.status.recommendedNextCheckAt()
             )
         }
     }
@@ -123,9 +130,10 @@ class ShellTaskManager(
         )
     }
 
-    fun statusPublic(taskId: String, includeCommand: Boolean = false): PublicTaskStatusResult {
+    fun statusPublic(taskId: String, includeCommand: Boolean = false, waitMillis: Long = 0L): PublicTaskStatusResult {
         return try {
-            val details = statusDetails(taskId)
+            val cached = shouldReturnCachedStatus(taskId, waitMillis)
+            val details = if (cached) mapOf("task" to status(taskId), "queryFailed" to false, "cached" to true) else statusDetailsWithWait(taskId, waitMillis)
             val task = details["task"] as? ShellTask ?: status(taskId)
             val exitCode = details["exitCode"] as? Int
             val queryFailed = details["queryFailed"] as? Boolean ?: false
@@ -134,6 +142,8 @@ class ShellTaskManager(
             PublicTaskStatusResult(
                 taskId = task.taskId,
                 status = if (queryFailed) "unknown" else task.status.publicName(),
+                displayTitle = "查询任务状态",
+                displaySummary = "taskId=${task.taskId}${task.workingDirectory?.let { ", cwd=$it" } ?: ""}",
                 command = task.command.takeIf { includeCommand },
                 commandPreview = task.command.preview(),
                 commandLength = task.command.length,
@@ -146,13 +156,18 @@ class ShellTaskManager(
                 durationMillis = if (startedAtEpoch != null && endedAtEpoch != null) (endedAtEpoch - startedAtEpoch) * 1000 else null,
                 running = details["running"] as? Boolean,
                 exitCode = exitCode,
-                message = if (queryFailed) "Task status is temporarily unavailable. Try again later or call shell_task_recover." else null,
-                nextActions = nextActionsFor(task.status)
+                message = if (queryFailed) "Task status is temporarily unavailable. Try again later or call shell_task_recover." else task.status.pollingMessage(),
+                nextActions = nextActionsFor(task.status),
+                pollAfterMillis = task.status.pollAfterMillis(),
+                recommendedNextCheckAt = task.status.recommendedNextCheckAt(),
+                cached = details["cached"] as? Boolean ?: false
             )
         } catch (throwable: Throwable) {
             PublicTaskStatusResult(
                 taskId = taskId,
                 status = "unknown",
+                displayTitle = "查询任务状态",
+                displaySummary = "taskId=$taskId",
                 command = null,
                 cwd = null,
                 createdAt = "",
@@ -215,6 +230,8 @@ class ShellTaskManager(
             PublicTaskLogsResult(
                 taskId = taskId,
                 status = (details["status"] as? String)?.lowercase() ?: "unknown",
+                displayTitle = "读取任务日志",
+                displaySummary = "taskId=$taskId, maxLines=${details["maxLines"]}, maxBytes=${details["maxBytes"]}",
                 stdout = details["stdout"] as? String,
                 stderr = details["stderr"] as? String,
                 exitCode = details["exitCode"] as? Int,
@@ -222,13 +239,17 @@ class ShellTaskManager(
                 maxBytes = details["maxBytes"] as? Int,
                 stdoutTruncated = details["stdoutTruncated"] as? Boolean ?: false,
                 stderrTruncated = details["stderrTruncated"] as? Boolean ?: false,
-                message = if (details["queryFailed"] as? Boolean == true) "Task logs are temporarily unavailable. Try again later or call shell_task_recover." else null,
-                nextActions = nextActionsFor((details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() })
+                message = if (details["queryFailed"] as? Boolean == true) "Task logs are temporarily unavailable. Try again later or call shell_task_recover." else (details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() }?.pollingMessage(),
+                nextActions = nextActionsFor((details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() }),
+                pollAfterMillis = (details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() }?.pollAfterMillis(),
+                recommendedNextCheckAt = (details["status"] as? String)?.let { runCatching { ShellTaskStatus.valueOf(it) }.getOrNull() }?.recommendedNextCheckAt()
             )
         } catch (throwable: Throwable) {
             PublicTaskLogsResult(
                 taskId = taskId,
                 status = "unknown",
+                displayTitle = "读取任务日志",
+                displaySummary = "taskId=$taskId",
                 message = publicErrorMessage(throwable, taskId)
             )
         }
@@ -328,6 +349,34 @@ class ShellTaskManager(
     fun debug(taskId: String): Map<String, Any?> {
         return statusDetails(taskId)
     }
+
+    private fun statusDetailsWithWait(taskId: String, waitMillis: Long): Map<String, Any?> {
+        val timeout = waitMillis.coerceIn(0L, MAX_STATUS_WAIT_TIMEOUT_MS)
+        if (timeout == 0L) return statusDetails(taskId)
+        val deadline = System.currentTimeMillis() + timeout
+        var latest = statusDetails(taskId)
+        var latestTask = latest["task"] as? ShellTask
+        while (latestTask?.status == ShellTaskStatus.Queued || latestTask?.status == ShellTaskStatus.Running) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0L) break
+            Thread.sleep(STATUS_LONG_POLL_INTERVAL_MS.coerceAtMost(remaining))
+            latest = statusDetails(taskId)
+            latestTask = latest["task"] as? ShellTask
+        }
+        return latest
+    }
+
+    private fun shouldReturnCachedStatus(taskId: String, waitMillis: Long): Boolean {
+        if (waitMillis > 0L) return false
+        val now = System.currentTimeMillis()
+        val previous = lastPublicStatusQueryAt.put(taskId, now) ?: return false
+        if (now - previous >= MIN_PUBLIC_STATUS_QUERY_INTERVAL_MS) return false
+        val task = runCatching { status(taskId) }.getOrNull() ?: return false
+        return task.status == ShellTaskStatus.Queued || task.status == ShellTaskStatus.Running
+    }
+
+    private fun ShellTask.displaySummary(): String =
+        "${command.preview()}${workingDirectory?.let { " @ $it" } ?: ""}"
 
     private fun waitForShortTask(task: ShellTask, waitMillis: Long): ShellExecResult {
         val timeout = waitMillis.coerceIn(0L, MAX_EXEC_WAIT_TIMEOUT_MS)
@@ -512,6 +561,9 @@ class ShellTaskManager(
         private const val RECOVER_CALLBACK_TIMEOUT_MS = 8_000L
         private const val REFRESH_CALLBACK_TIMEOUT_MS = 500L
         private const val MAX_EXEC_WAIT_TIMEOUT_MS = 30_000L
+        private const val MAX_STATUS_WAIT_TIMEOUT_MS = 60_000L
+        private const val STATUS_LONG_POLL_INTERVAL_MS = 1_000L
+        private const val MIN_PUBLIC_STATUS_QUERY_INTERVAL_MS = 2_000L
         private const val EXEC_POLL_INTERVAL_MS = 250L
         private const val MAX_EXEC_INLINE_LOG_LINES = 500
         private const val DEFAULT_MAX_LOG_BYTES = 64 * 1024

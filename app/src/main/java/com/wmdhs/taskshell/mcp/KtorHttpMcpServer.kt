@@ -201,11 +201,19 @@ class KtorHttpMcpServer(
 
     private fun McpTool.toJson(): JSONObject = JSONObject()
         .put("name", name)
+        .put("title", title)
         .put("description", description)
 
     private fun McpTool.toMcpJson(): JSONObject = JSONObject()
         .put("name", name)
+        .put("title", title)
         .put("description", description)
+        .put("annotations", JSONObject()
+            .put("title", title)
+            .put("readOnlyHint", readOnlyHint)
+            .put("destructiveHint", destructiveHint)
+            .put("openWorldHint", openWorldHint)
+        )
         .put("inputSchema", inputSchemaFor(name))
 
     private fun inputSchemaFor(toolName: String): JSONObject {
@@ -254,13 +262,15 @@ class KtorHttpMcpServer(
                     .put("stdin", stringProp("Optional stdin content passed to the command. Limited to 256 KiB."))
                     .put("input", stringProp("Alias of stdin."))
                     .put("timeoutMillis", intProp("Optional command timeout. The task fails if the command exceeds this duration.", null, 1, 86400000))
+                    .put("waitMillis", intProp("Optional short wait before returning. If the task finishes within this time, returns inline result; otherwise returns taskId plus pollAfterMillis. Prefer this over immediate status polling.", 0, 0, 30000))
                     .put("includeCommand", boolProp("Return the full command in the result. Defaults to false; commandPreview, commandLength, and commandSha256 are returned instead.")),
                 required = listOf("command")
             )
             "shell_task_status" -> schema(
                 JSONObject()
                     .put("taskId", stringProp("Task id returned by shell_task_start or shell_exec."))
-                    .put("includeCommand", boolProp("Return the full command in the result. Defaults to false; commandPreview, commandLength, and commandSha256 are returned instead.")),
+                    .put("includeCommand", boolProp("Return the full command in the result. Defaults to false; commandPreview, commandLength, and commandSha256 are returned instead."))
+                    .put("waitMillis", intProp("Optional long-poll wait time. The server waits up to this duration for task completion, reducing repeated status calls.", 0, 0, 60000)),
                 required = listOf("taskId")
             )
             "shell_task_logs" -> schema(
